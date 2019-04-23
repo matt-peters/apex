@@ -8,19 +8,19 @@ from apex.parallel import ReduceOp
 
 class SyncBatchNorm(_BatchNorm):
     """
-    synchronized batch normalization module extented from `torch.nn.BatchNormNd`
+    synchronized batch normalization module extented from ``torch.nn.BatchNormNd``
     with the added stats reduction across multiple processes.
     :class:`apex.parallel.SyncBatchNorm` is designed to work with
-    `DistributedDataParallel`.
+    ``DistributedDataParallel``.
 
     When running in training mode, the layer reduces stats across all processes
     to increase the effective batchsize for normalization layer. This is useful
     in applications where batch size is small on a given process that would
     diminish converged accuracy of the model. The model uses collective
-    communication package from `torch.distributed`.
+    communication package from ``torch.distributed``.
 
     When running in evaluation mode, the layer falls back to
-    `torch.nn.functional.batch_norm`
+    ``torch.nn.functional.batch_norm``.
 
     Args:
         num_features: :math:`C` from an expected input of size
@@ -37,7 +37,8 @@ class SyncBatchNorm(_BatchNorm):
             this module does not track such statistics and always uses batch
             statistics in both training and eval modes. Default: ``True``
 
-    Examples::
+    Example::
+
         >>> sbn = apex.parallel.SyncBatchNorm(100).cuda()
         >>> inp = torch.randn(10, 100, 14, 14).cuda()
         >>> out = sbn(inp)
@@ -45,7 +46,16 @@ class SyncBatchNorm(_BatchNorm):
         >>> out = sbn(inp)
     """
 
-    def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True, process_group=None):
+    warned = False
+
+    def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True, process_group=None, channel_last=False):
+        if channel_last == True:
+            raise AttributeError("channel_last is not supported by primitive SyncBatchNorm implementation. Try install apex with `--cuda_ext` if channel_last is desired.")
+
+        if not SyncBatchNorm.warned:
+            print("Warning:  using Python fallback for SyncBatchNorm, possibly because apex was installed without --cuda_ext.  The exception raised when attempting to import the cuda backend was: ", self.syncbn_import_error)
+            SyncBatchNorm.warned = True
+
         super(SyncBatchNorm, self).__init__(num_features, eps=eps, momentum=momentum, affine=affine, track_running_stats=track_running_stats)
         self.process_group = process_group
 
@@ -62,10 +72,9 @@ class SyncBatchNorm(_BatchNorm):
             return F.batch_norm(input, self.running_mean, self.running_var, self.weight, self.bias, False, 0.0, self.eps)
         else:
             process_group = self.process_group
-            world_size = 0
+            world_size = 1
             if not self.process_group:
                 process_group = torch.distributed.group.WORLD
-            world_size = torch.distributed.get_world_size(process_group)
             self.num_batches_tracked += 1
             with torch.no_grad():
                 channel_first_input = input.transpose(0, 1).contiguous()
@@ -78,6 +87,7 @@ class SyncBatchNorm(_BatchNorm):
                 local_sqr_mean = torch.pow(
                     squashed_input_tensor_view, 2).mean(1)
                 if torch.distributed.is_initialized():
+                    world_size = torch.distributed.get_world_size(process_group)
                     torch.distributed.all_reduce(
                         local_mean, ReduceOp.SUM, process_group)
                     mean = local_mean / world_size

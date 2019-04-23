@@ -2,6 +2,7 @@ import torch
 from torch.nn.modules.batchnorm import _BatchNorm
 from torch.nn import functional as F
 
+import syncbn
 from .optimized_sync_batchnorm_kernel import SyncBatchnormFunction
 
 
@@ -54,7 +55,7 @@ class SyncBatchNorm(_BatchNorm):
         >>> inp = torch.randn(10, 14, 14, 100).cuda()
     """
 
-    def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True, process_group=None, channel_last = False):
+    def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True, process_group=None, channel_last=False):
         super(SyncBatchNorm, self).__init__(num_features, eps=eps, momentum=momentum, affine=affine, track_running_stats=track_running_stats)
         self.process_group = process_group
         self.channel_last = channel_last
@@ -66,7 +67,10 @@ class SyncBatchNorm(_BatchNorm):
         self.channel_last = channel_last
 
     def forward(self, input):
-        if not self.training and self.track_running_stats and not self.channel_last:
+        # if input.dim() == 2, we switch to channel_last for efficient memory accessing
+        channel_last = self.channel_last if input.dim() != 2 else True
+
+        if not self.training and self.track_running_stats and not channel_last:
             # fall back to pytorch implementation for inference
             return F.batch_norm(input, self.running_mean, self.running_var, self.weight, self.bias, False, 0.0, self.eps)
         else:
@@ -77,4 +81,4 @@ class SyncBatchNorm(_BatchNorm):
                     exponential_average_factor = 1.0 / float(self.num_batches_tracked)
                 else:
                     exponential_average_factor = self.momentum
-            return SyncBatchnormFunction.apply(input, self.weight, self.bias, self.running_mean, self.running_var, self.eps, self.training or not self.track_running_stats, exponential_average_factor, self.process_group, self.channel_last)
+            return SyncBatchnormFunction.apply(input, self.weight, self.bias, self.running_mean, self.running_var, self.eps, self.training or not self.track_running_stats, exponential_average_factor, self.process_group, channel_last)

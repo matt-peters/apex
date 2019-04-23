@@ -1,22 +1,36 @@
 import torch
-# from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
-try: 
-    from apex_C import flatten
-    from apex_C import unflatten
-except ImportError:
-    try:
-        _ = warned_flatten
-    except NameError:
-        print("Warning:  apex was installed without --cpp_ext.  Falling back to Python flatten and unflatten.")
-        warned_flatten = True
-    from torch._utils import _flatten_dense_tensors as flatten
-    from torch._utils import _unflatten_dense_tensors as unflatten
 import torch.distributed as dist
 from torch.nn.modules import Module
 from torch.autograd import Variable
 from collections import OrderedDict
 from itertools import chain
 import copy
+import importlib
+from ..multi_tensor_apply import multi_tensor_applier
+
+imported_flatten_impl = False
+
+def import_flatten_impl():
+    global flatten_impl, unflatten_impl, imported_flatten_impl
+    try:
+        import apex_C
+        flatten_impl = apex_C.flatten
+        unflatten_impl = apex_C.unflatten
+    except ImportError:
+        print("Warning:  apex was installed without --cpp_ext.  Falling back to Python flatten and unflatten.")
+        flatten_impl = torch._utils._flatten_dense_tensors
+        unflatten_impl = torch._utils._unflatten_dense_tensors
+    imported_flatten_impl = True
+
+def flatten(bucket):
+    if not imported_flatten_impl:
+        import_flatten_impl()
+    return flatten_impl(bucket)
+
+def unflatten(coalesced, bucket):
+    if not imported_flatten_impl:
+        import_flatten_impl()
+    return unflatten_impl(coalesced, bucket)
 
 # apply_dist_call requires that tensors in 'bucket' are all the same type.
 def apply_flat_dist_call(bucket, call, extra_args=None):
@@ -78,7 +92,7 @@ class Reducer(object):
     across processes.  :class:`Reducer` is intended to give the user additional control:
     Unlike :class:`DistributedDataParallel`, :class:`Reducer` will not automatically allreduce
     parameters during ``backward()``.
-    Instead, :class:`Reducer` waits for the user to call `<reducer_instance>.reduce()` manually.
+    Instead, :class:`Reducer` waits for the user to call ``<reducer_instance>.reduce()`` manually.
     This enables, for example, delaying the allreduce to be carried out every 
     several iterations instead of every single iteration.
 
@@ -213,7 +227,13 @@ class DistributedDataParallel(Module):
         self.param_type_to_tmp_i = {"torch.cuda.HalfTensor" : 0, 
                                     "torch.cuda.FloatTensor" : 1,
                                     "torch.cuda.DoubleTensor" : 2}
-                 
+
+        if multi_tensor_applier.available:
+            # TODO:  I really need to centralize the C++ backed imports
+            import amp_C
+            self.multi_tensor_scale = amp_C.multi_tensor_scale
+            self._overflow_buf = torch.cuda.IntTensor([0])
+
         self.create_hooks()
 
         flat_dist_call([param.data for param in self.module.parameters()], dist.broadcast, (0,) )
@@ -383,8 +403,15 @@ class DistributedDataParallel(Module):
                                    "allreduce buffer.  This is almost certainly an error.")
             self.allreduce_buffers[bucket_idx] = allreduced
         else:
-            for buf, synced in zip(bucket, unflatten(allreduced, bucket)):
-                buf.copy_(synced)
+            if multi_tensor_applier.available:
+                multi_tensor_applier(
+                    self.multi_tensor_scale,
+                    self._overflow_buf,
+                    [unflatten(allreduced, bucket), bucket],
+                    1.0)
+            else:
+                for buf, synced in zip(bucket, unflatten(allreduced, bucket)):
+                    buf.copy_(synced)
 
 
     def allreduce_fallback(self):

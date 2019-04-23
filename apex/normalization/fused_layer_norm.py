@@ -3,11 +3,14 @@ import torch
 import numbers
 from torch.nn.parameter import Parameter
 from torch.nn import init
-
-import fused_layer_norm_cuda
+from torch.nn import functional as F
+import importlib
 
 class FusedLayerNormAffineFunction(torch.autograd.Function):
   def __init__(self, normalized_shape, eps=1e-6):
+    global fused_layer_norm_cuda
+    fused_layer_norm_cuda = importlib.import_module("fused_layer_norm_cuda")
+
     self.normalized_shape = normalized_shape
     self.eps = eps
 
@@ -31,6 +34,8 @@ class FusedLayerNormAffineFunction(torch.autograd.Function):
     
 class FusedLayerNormFunction(torch.autograd.Function):
   def __init__(self, normalized_shape, eps=1e-6):
+    global fused_layer_norm_cuda
+    fused_layer_norm_cuda = importlib.import_module("fused_layer_norm_cuda")
     self.normalized_shape = normalized_shape
     self.eps = eps
 
@@ -117,6 +122,10 @@ class FusedLayerNorm(torch.nn.Module):
     """
     def __init__(self, normalized_shape, eps=1e-5, elementwise_affine=True):
         super(FusedLayerNorm, self).__init__()
+
+        global fused_layer_norm_cuda
+        fused_layer_norm_cuda = importlib.import_module("fused_layer_norm_cuda")
+
         if isinstance(normalized_shape, numbers.Integral):
             normalized_shape = (normalized_shape,)
         self.normalized_shape = torch.Size(normalized_shape)
@@ -136,6 +145,9 @@ class FusedLayerNorm(torch.nn.Module):
             init.zeros_(self.bias)
 
     def forward(self, input):
+        if not input.is_cuda:
+            return  F.layer_norm(
+                input, self.normalized_shape, self.weight, self.bias, self.eps)
         if self.elementwise_affine:
           return FusedLayerNormAffineFunction(self.normalized_shape,self.eps)(
               input, self.weight, self.bias)
